@@ -40,7 +40,21 @@ The key features of Dora are:
 Quickstart
 ----------
 
-To install, simply run ``setup.py``:
+Dora requires ``nlopt``, which is not distributed as a pip package. YOu
+can install using ``environment.yml`` and conda:
+
+.. code:: console
+
+   $ conda create -f environment.yml
+
+This creates a new conda environment called ``dora`` which you can activate
+using 
+
+.. code:: console
+
+   $ source activate dora
+
+Then you can install the package in the dora environment by simply running ``setup.py``:
 
 .. code:: console
 
