@@ -36,7 +36,7 @@ consequences that drive the plan below:
 | MLE hyperparameter training | **optax** (Adam warm-start, then L-BFGS) | Replaces `nlopt` for the default point-estimate training mode |
 | Fully-Bayesian hyperparameters (opt-in) | **BlackJAX NUTS** | Posterior over kernel hyperparameters instead of a point estimate |
 | GP model/kernel layer | **Hand-rolled JAX port of `dora/regressors/gp`** | See tradeoff below — not GPJax/TinyGP |
-| Delaunay sampler | **Unchanged, scipy-based** | Not a Bayesian model, no JAX/BlackJAX involvement |
+| Delaunay sampler | **Replaced with a pure-JAX inverse-distance-weighting (IDW) interpolant** | No JAX-native Delaunay triangulation exists — see below |
 | Server | **FastAPI + pydantic** (replacing Flask) | Not JAX-related, but part of the rewrite (Phase 4) |
 
 **BlackJAX's actual role:** BlackJAX is an inference-algorithm library
@@ -59,10 +59,34 @@ abstraction fight plus a heavier dependency. Tradeoff accepted: more
 Cholesky/predict plumbing ourselves, in exchange for 100% behavioral
 fidelity and one migration instead of two.
 
-**Delaunay sampler:** left untouched. It's not a Bayesian/probabilistic
-model — no gradients, no inference — so JAX/BlackJAX add nothing, and
-`scipy.spatial.Delaunay`'s incremental triangulation has no JAX equivalent
-anyway.
+**Delaunay sampler — replaced, not ported.** Researched whether a pure-JAX,
+GPU-accelerated Delaunay triangulation exists: it doesn't. GPU-accelerated
+Delaunay triangulation is still an active algorithms-research problem
+(e.g. gDel3D, Local DeWall — hybrid GPU/CPU repair algorithms, not
+libraries), and the only tensor-framework-native implementation is
+`torch_delaunay` (PyTorch, not JAX). Triangulation is inherently
+sequential/combinatorial — it isn't the kind of computation `jit`/`vmap`/
+autodiff apply to, so forcing scipy's `Delaunay`/Qhull into JAX isn't a
+real option.
+
+Recommendation: swap the *interpolation method*, not the triangulation
+algorithm. Replace Delaunay + bilinear interpolation with
+**inverse-distance-weighting (IDW)** implemented directly in
+`jax.numpy`: weight training targets by an inverse power of distance from
+the query point, normalize. No triangulation step at all, trivially
+`vmap`-able over many query points, fully differentiable, and GPU-native
+for free as an ordinary JAX computation — it plays exactly the role
+Delaunay plays today (a cheap, non-Bayesian interpolant with no
+hyperparameter training), without the topology-construction cost or an
+external geometry dependency.
+
+If IDW's purely-local interpolation proves too crude in practice, there's
+a second pure-JAX fallback that reuses the GP core already being built:
+kernel/RBF interpolation via a direct linear solve against a fixed kernel
+(reusing the ported `linalg.py`/`predict.py`, skipping MLE training) —
+same JAX/GPU-native properties, more accuracy at the cost of an O(n³)
+solve as the training set grows. Start with IDW; only escalate to the
+RBF fallback if IDW's accuracy is measurably insufficient.
 
 ---
 
@@ -80,7 +104,7 @@ anyway.
 | `regressors/gp/types.py` | **Redesign as JAX pytree dataclasses** | See §4 |
 | `active_sampling/base_sampler.py` | **Keep as plain Python/numpy** | Mutable orchestration shell, deliberately outside JAX — see §3 |
 | `active_sampling/gp_sampler.py` | **Redesign internals, keep public API** | Rewire off `revrand.legacygp` onto the new JAX `regressors/gp`; `pick`/`update`/`predict` signatures unchanged |
-| `active_sampling/delaunay_sampler.py` | **Keep as-is** | scipy-based, not a JAX candidate |
+| `active_sampling/delaunay_sampler.py` | **Replace with pure-JAX IDW interpolant** | No JAX-native Delaunay triangulation exists (only `torch_delaunay` for PyTorch); IDW fills the same "cheap non-Bayesian interpolant" role, GPU-native, no triangulation dependency |
 | `server/server.py`, `response.py` | **Replace with FastAPI + pydantic** | Phase 4, not JAX-related |
 | `revrand.legacygp` (external dep) | **Drop entirely** | Superseded by the promoted, ported `regressors/gp` |
 | `nlopt` | **Drop** | Fully replaced by `optax` |
@@ -88,30 +112,66 @@ anyway.
 
 ---
 
-## 3. Orchestration: functional core, imperative shell
+## 3. Orchestration: fully immutable, functional state-threading
 
-Keep `Sampler`/`GaussianProcess` as ordinary mutable Python objects
-(`ArrayBuffer`, `pending_results: dict[uid -> index]`, `uuid.uuid4().hex`
-job IDs) exactly as today. Push only the numerically heavy work — train,
-condition, predict, acquisition scoring — into pure, `@jax.jit`-decorated
-functions operating on plain arrays or small immutable pytree structs.
+Revised from a hybrid "mutable shell around a jitted core" design after
+discussion — the project prefers to keep immutability and a functional
+style all the way out to the `Sampler` boundary, not just in the inner
+math. `Sampler`/`GaussianProcess` state becomes a single frozen, pytree-
+registered dataclass, and `pick`/`update` become pure functions that
+return a new state rather than mutating one in place:
 
-`pick()`/`update()` stay regular Python methods doing buffer/dict
-bookkeeping in numpy, calling out to jitted pure functions:
-`gp_core.train(X, y, kerneldef, ...) -> hyperparams`,
-`gp_core.condition(...) -> RegressionState`,
-`gp_core.predict(state, Xq) -> (mean, var)`,
-`gp_core.acquire(state, Xq) -> scores`.
+```python
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class SamplerState:
+    X: Float[Array, "capacity d"]
+    y: Float[Array, "capacity t"]
+    virtual_flag: Bool[Array, "capacity"]
+    n_filled: int                      # cursor into the preallocated buffers
+    pending: dict[str, int]            # copied, never mutated, per call
+    key: PRNGKeyArray
 
-**Why not go fully functional** (threading an immutable sampler-state
-through every call): the async pick-now/observe-later workflow with
-out-of-order `update(uid, ...)` resolution has no benefit from
-immutability — a dict keyed by opaque IDs is the right structure for "a
-job handed out, not yet resolved," and none of that bookkeeping runs
-inside `jit` anyway. One accepted tradeoff: `Sampler` objects aren't
-directly `vmap`-able across whole samplers — acceptable, since nothing
-today needs to batch across samplers, only across candidate points within
-one sampler's `pick()`.
+class Sampler(Protocol):
+    def pick(self, state: SamplerState) -> tuple[SamplerState, Float[Array, "d"], str]: ...
+    def update(self, state: SamplerState, uid: str, y_true: Float[Array, "t"]) -> SamplerState: ...
+```
+
+Callers (demo scripts, the REST server, notebooks) hold the current state
+explicitly and thread it forward: `state, x, uid = sampler.pick(state)`.
+The numerically heavy work (train/condition/predict/acquisition scoring)
+is still `@jax.jit`-decorated pure functions operating on `state`'s array
+fields, exactly as before — the change is that the *outer* orchestration
+is now equally pure, not a mutable object wrapping a pure core.
+
+Two things make this practical rather than merely principled:
+
+- **Preallocated buffers, not append-and-copy.** `X`/`y`/`virtual_flag`
+  get a fixed `capacity` up front (or grow by doubling — allocate a new,
+  bigger array and copy once, the same amortized cost as the old
+  `ArrayBuffer`'s doubling strategy, just expressed as "build new state"
+  instead of "mutate in place"). Writes are `X.at[n_filled].set(row)` —
+  the standard JAX functional-update idiom, not an O(n) append per call.
+- **`pending` stays a plain dict, copied on write**, not reinvented as a
+  persistent/immutable map. Outstanding job counts are small in practice
+  (a handful to low hundreds at once), so `{**pending, uid: idx}` per
+  `pick`/`update` is cheap. Not worth a specialized data structure for
+  this.
+
+**What this buys over the hybrid design:** every `SamplerState` is a
+snapshot — checkpointing, replay, and time-travel debugging fall out for
+free (want to see what the sampler would have picked 10 steps ago? you
+already have that state object). It also makes the whole sampler
+formally `vmap`-able across independent runs later, which a mutable
+outer shell would foreclose.
+
+**Cost, stated plainly:** callers must explicitly carry the returned
+state forward instead of calling methods on a persistent object — a
+small ergonomic tax, and arguably good practice for reproducibility
+regardless. The async pick-now/observe-later workflow with out-of-order
+`update(uid, ...)` resolution still works fine under this model: `pending`
+is just a value living inside the immutable state, resolved by whichever
+`update()` call names the right `uid`, in whatever order they arrive.
 
 ---
 
@@ -233,14 +293,20 @@ platforms = ["osx-arm64", "linux-64"]  # win-64 dropped, see below
 
 [dependencies]
 python = ">=3.12,<3.13"
-jax = "*"
-jaxlib = "*"
 blackjax = "*"
 optax = "*"
 numpy = "*"
 scipy = "*"
 typer = "*"
 rich = "*"
+# jax/jaxlib deliberately NOT here — see [feature.cpu] / [feature.gpu] below
+
+[feature.cpu.dependencies]
+jax = "*"
+jaxlib = "*"          # conda-forge CPU build
+
+[feature.gpu.pypi-dependencies]
+jax = { version = "*", extras = ["cuda12"] }  # pulls its own jaxlib; do not combine with feature.cpu
 
 [feature.dev.dependencies]
 pytest = "*"
@@ -261,9 +327,10 @@ mkdocstrings = "*"
 mkdocstrings-python = "*"
 
 [environments]
-default = ["dev", "docs"]
-dev = ["dev"]
+default = ["dev", "docs", "cpu"]
+dev = ["dev", "cpu"]
 docs = ["docs"]
+gpu = ["dev", "gpu"]
 
 [tasks]
 quality = { cmd = "python scripts/quality.py", description = "Lint, format, typecheck, coverage" }
@@ -274,14 +341,28 @@ test = { cmd = "python scripts/test.py", description = "Unit/integration/parity 
 check-all = { cmd = "python scripts/test.py all && python scripts/quality.py check", description = "Everything CI runs" }
 ```
 
-Every package above resolves on conda-forge; no `[pypi-dependencies]`
-fallback is expected for this stack. If GPJax is ever adopted, it's also
-on conda-forge.
+Every package except GPU `jax` resolves on conda-forge. If GPJax is ever
+adopted, it's also on conda-forge.
 
-**GPU:** default environment stays CPU-only. Document a GPU opt-in
-(separate `feature.gpu` environment via pip wheels — Google's own CUDA
-wheels move faster than conda-forge's rebuilds) rather than making GPU the
-default multi-platform solve.
+**GPU: built in now, not deferred** (per your call — GPU support is
+needed from the start, not a later add-on). JAX's own CUDA wheels
+(`pip install "jax[cuda12]"`) move faster than conda-forge's CUDA
+rebuilds, so GPU support goes through pixi's `[pypi-dependencies]` in a
+dedicated `gpu` feature/environment (`pixi run -e gpu ...`), while a
+separate `cpu` feature keeps the conda-forge `jaxlib` for anyone without
+a GPU. **`cpu` and `gpu` are mutually exclusive alternatives**, not
+additive layers — don't resolve both `jaxlib` (conda-forge) and
+`jax[cuda12]` (pip) into the same environment, they'll conflict. That's
+why `jax`/`jaxlib` were pulled out of the shared `[dependencies]` block
+above and into `feature.cpu`/`feature.gpu` specifically.
+
+**Open follow-up this creates:** GitHub-hosted Actions runners are
+CPU-only, so `pixi run -e gpu ...` has no coverage in the CI matrix
+sketched below unless a self-hosted GPU runner is wired up. Until that
+exists, GPU correctness has to be verified locally before merging
+anything that touches GPU-sensitive code paths — flag this as a real
+operational gap, not just a config detail, since "GPU support" isn't
+actually verified in CI otherwise.
 
 **Windows:** drop `win-64`. `jaxlib` has no conda-forge Windows build, and
 upstream JAX doesn't officially support native Windows (recommends WSL2).
@@ -447,17 +528,34 @@ opt-in since it changes numeric output — not a silent default swap.
 (`jaxopt` is being folded into `optax` and shouldn't be taken on as a new
 dependency.)
 
+**Delaunay → IDW migration** can run in parallel with any phase above —
+it's a separate, self-contained sampler class, independent of the GP core
+(Phase 1) and its sampler wiring (Phase 2). Recommend doing it alongside
+Phase 1: it's small, has no triangulation-library dependency risk to
+manage, and gives an early, low-risk JAX/GPU-native win while the harder
+GP port is underway.
+
 ---
 
-## 8. Open decisions for you
+## 8. Decisions
 
-1. **Exotic kernels** (`non_stationary`/`tree`/`nonstat_rr`) — port in
-   Phase 1, or defer indefinitely since nothing currently calls them?
-2. **Delaunay sampler** — keep indefinitely, or deprioritize/drop if usage
-   data shows it's rarely selected?
-3. **Fully-Bayesian default** — confirm MLE (Phase 1/2) stays the default
-   `predict()` behavior, with BlackJAX NUTS strictly opt-in (Phase 3),
-   given the latency concern for a synchronous sampling loop.
-4. **GPU support** — is GPU actually needed, or is this CPU-only in
-   practice? Affects whether the GPU-opt-in pixi environment is worth
-   building now vs deferring.
+Resolved in discussion:
+
+1. **Exotic kernels** (`non_stationary`/`tree`/`nonstat_rr`) — **deferred
+   indefinitely.** Not ported until a real caller needs them; keeps
+   Phase 1 scope tight instead of solving a hard jit-compatibility problem
+   for currently-dead code.
+2. **Delaunay sampler** — **replaced with a pure-JAX IDW interpolant**
+   (§1, §2), not kept scipy-based, since GPU-native was a hard requirement
+   and no JAX Delaunay implementation exists to port to instead.
+3. **Fully-Bayesian default** — **MLE/optax stays the default**
+   `predict()` behavior; BlackJAX NUTS is strictly opt-in (Phase 3), given
+   the latency cost of full posterior inference inside a synchronous
+   pick-loop.
+4. **GPU support** — **needed now, not deferred.** Built into the pixi
+   setup as a first-class `gpu` feature/environment from the start (§5),
+   with the CI-coverage gap (no GPU runner in the sketched Actions matrix)
+   flagged as an explicit open follow-up rather than silently ignored.
+5. **Sampler orchestration** — **fully immutable/functional state
+   threading** (§3), not a mutable object wrapping a jitted core. Revised
+   from the original hybrid recommendation after discussion.
