@@ -36,7 +36,7 @@ consequences that drive the plan below:
 | MLE hyperparameter training | **optax** (Adam warm-start, then L-BFGS) | Replaces `nlopt` for the default point-estimate training mode |
 | Fully-Bayesian hyperparameters (opt-in) | **BlackJAX NUTS** | Posterior over kernel hyperparameters instead of a point estimate |
 | GP model/kernel layer | **Hand-rolled JAX port of `dora/regressors/gp`** | See tradeoff below — not GPJax/TinyGP |
-| Delaunay sampler | **Replaced with a pure-JAX inverse-distance-weighting (IDW) interpolant** | No JAX-native Delaunay triangulation exists — see below |
+| Delaunay sampler | **Kept, scipy-based, unchanged** — plus a new pure-JAX IDW interpolant added alongside it | No JAX-native Delaunay triangulation exists, so a GPU-native option is added as a sibling sampler, not a replacement — see below |
 | Server | **FastAPI + pydantic** (replacing Flask) | Not JAX-related, but part of the rewrite (Phase 4) |
 
 **BlackJAX's actual role:** BlackJAX is an inference-algorithm library
@@ -59,34 +59,38 @@ abstraction fight plus a heavier dependency. Tradeoff accepted: more
 Cholesky/predict plumbing ourselves, in exchange for 100% behavioral
 fidelity and one migration instead of two.
 
-**Delaunay sampler — replaced, not ported.** Researched whether a pure-JAX,
-GPU-accelerated Delaunay triangulation exists: it doesn't. GPU-accelerated
-Delaunay triangulation is still an active algorithms-research problem
-(e.g. gDel3D, Local DeWall — hybrid GPU/CPU repair algorithms, not
-libraries), and the only tensor-framework-native implementation is
-`torch_delaunay` (PyTorch, not JAX). Triangulation is inherently
-sequential/combinatorial — it isn't the kind of computation `jit`/`vmap`/
-autodiff apply to, so forcing scipy's `Delaunay`/Qhull into JAX isn't a
-real option.
+**Delaunay sampler — kept, plus a new pure-JAX sibling added alongside
+it.** Researched whether a pure-JAX, GPU-accelerated Delaunay
+triangulation exists: it doesn't. GPU-accelerated Delaunay triangulation
+is still an active algorithms-research problem (e.g. gDel3D, Local
+DeWall — hybrid GPU/CPU repair algorithms, not libraries), and the only
+tensor-framework-native implementation is `torch_delaunay` (PyTorch, not
+JAX). Triangulation is inherently sequential/combinatorial — it isn't the
+kind of computation `jit`/`vmap`/autodiff apply to, so forcing scipy's
+`Delaunay`/Qhull into JAX isn't a real option, and there's no reason to
+force it out of the codebase either: it's simple, it works, and users may
+want it precisely because it has no training/hyperparameter step.
 
-Recommendation: swap the *interpolation method*, not the triangulation
-algorithm. Replace Delaunay + bilinear interpolation with
-**inverse-distance-weighting (IDW)** implemented directly in
-`jax.numpy`: weight training targets by an inverse power of distance from
-the query point, normalize. No triangulation step at all, trivially
-`vmap`-able over many query points, fully differentiable, and GPU-native
-for free as an ordinary JAX computation — it plays exactly the role
-Delaunay plays today (a cheap, non-Bayesian interpolant with no
-hyperparameter training), without the topology-construction cost or an
-external geometry dependency.
+Recommendation: **keep `delaunay_sampler.py` exactly as it is today**
+(scipy/CPU, satisfies the same `Sampler` Protocol as everything else), and
+**add a new sampler** — `IDWSampler` or similar — implementing
+**inverse-distance-weighting** directly in `jax.numpy`: weight training
+targets by an inverse power of distance from the query point, normalize.
+No triangulation step at all, trivially `vmap`-able over many query
+points, fully differentiable, and GPU-native for free as an ordinary JAX
+computation. Users choose whichever fits: Delaunay when they want
+exact-at-training-points piecewise-linear interpolation with no GPU
+dependency, IDW when they want a cheap GPU-native option with no
+triangulation cost as the point count grows.
 
-If IDW's purely-local interpolation proves too crude in practice, there's
-a second pure-JAX fallback that reuses the GP core already being built:
-kernel/RBF interpolation via a direct linear solve against a fixed kernel
-(reusing the ported `linalg.py`/`predict.py`, skipping MLE training) —
-same JAX/GPU-native properties, more accuracy at the cost of an O(n³)
-solve as the training set grows. Start with IDW; only escalate to the
-RBF fallback if IDW's accuracy is measurably insufficient.
+If IDW's purely-local interpolation proves too crude for some use case,
+there's a further pure-JAX option that reuses the GP core already being
+built: kernel/RBF interpolation via a direct linear solve against a fixed
+kernel (reusing the ported `linalg.py`/`predict.py`, skipping MLE
+training) — same JAX/GPU-native properties, more accuracy at the cost of
+an O(n³) solve as the training set grows. Not part of the initial scope;
+worth a future sampler variant if IDW's accuracy proves insufficient in
+practice.
 
 ---
 
@@ -104,7 +108,8 @@ RBF fallback if IDW's accuracy is measurably insufficient.
 | `regressors/gp/types.py` | **Redesign as JAX pytree dataclasses** | See §4 |
 | `active_sampling/base_sampler.py` | **Keep as plain Python/numpy** | Mutable orchestration shell, deliberately outside JAX — see §3 |
 | `active_sampling/gp_sampler.py` | **Redesign internals, keep public API** | Rewire off `revrand.legacygp` onto the new JAX `regressors/gp`; `pick`/`update`/`predict` signatures unchanged |
-| `active_sampling/delaunay_sampler.py` | **Replace with pure-JAX IDW interpolant** | No JAX-native Delaunay triangulation exists (only `torch_delaunay` for PyTorch); IDW fills the same "cheap non-Bayesian interpolant" role, GPU-native, no triangulation dependency |
+| `active_sampling/delaunay_sampler.py` | **Keep as-is** (scipy-based) | No JAX-native Delaunay triangulation exists to port to; kept as a valid CPU-only, no-training-step option |
+| *new:* `active_sampling/idw_sampler.py` | **Add**, pure-JAX IDW interpolant | Sibling sampler alongside Delaunay, not a replacement — GPU-native, no triangulation dependency |
 | `server/server.py`, `response.py` | **Replace with FastAPI + pydantic** | Phase 4, not JAX-related |
 | `revrand.legacygp` (external dep) | **Drop entirely** | Superseded by the promoted, ported `regressors/gp` |
 | `nlopt` | **Drop** | Fully replaced by `optax` |
@@ -528,12 +533,12 @@ opt-in since it changes numeric output — not a silent default swap.
 (`jaxopt` is being folded into `optax` and shouldn't be taken on as a new
 dependency.)
 
-**Delaunay → IDW migration** can run in parallel with any phase above —
-it's a separate, self-contained sampler class, independent of the GP core
-(Phase 1) and its sampler wiring (Phase 2). Recommend doing it alongside
-Phase 1: it's small, has no triangulation-library dependency risk to
-manage, and gives an early, low-risk JAX/GPU-native win while the harder
-GP port is underway.
+**New `IDWSampler`** can be built in parallel with any phase above — it's
+a separate, self-contained sampler class, independent of both the
+existing `delaunay_sampler.py` (untouched) and the GP core (Phase 1)/its
+sampler wiring (Phase 2). Recommend building it alongside Phase 1: it's
+small, has no external dependency risk, and gives an early, low-risk
+JAX/GPU-native win while the harder GP port is underway.
 
 ---
 
@@ -545,9 +550,11 @@ Resolved in discussion:
    indefinitely.** Not ported until a real caller needs them; keeps
    Phase 1 scope tight instead of solving a hard jit-compatibility problem
    for currently-dead code.
-2. **Delaunay sampler** — **replaced with a pure-JAX IDW interpolant**
-   (§1, §2), not kept scipy-based, since GPU-native was a hard requirement
-   and no JAX Delaunay implementation exists to port to instead.
+2. **Delaunay sampler** — **kept as-is** (scipy-based, CPU), with a new
+   pure-JAX `IDWSampler` added as a sibling option (§1, §2) rather than a
+   replacement — no JAX Delaunay implementation exists to port to, and
+   there's no reason to drop a working, dependency-light option just
+   because a GPU-native alternative is also wanted.
 3. **Fully-Bayesian default** — **MLE/optax stays the default**
    `predict()` behavior; BlackJAX NUTS is strictly opt-in (Phase 3), given
    the latency cost of full posterior inference inside a synchronous
